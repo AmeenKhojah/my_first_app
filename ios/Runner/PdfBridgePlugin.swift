@@ -179,9 +179,15 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
         attributes = [:]
       }
       let font = attributes[.font] as? UIFont
+      let fontSize = font?.pointSize ?? max(bounds.height * 0.8, 8)
       let color = attributes[.foregroundColor] as? UIColor ?? .black
-      let left = (bounds.minX - pageBounds.minX) / pageBounds.width
-      let top = (pageBounds.maxY - bounds.maxY) / pageBounds.height
+      let tightBounds = tightenedTextBounds(
+        bounds,
+        text: text,
+        fontSize: fontSize
+      )
+      let left = (tightBounds.minX - pageBounds.minX) / pageBounds.width
+      let top = (pageBounds.maxY - tightBounds.maxY) / pageBounds.height
 
       return [
         "id": "p\(pageIndex)-l\(index)",
@@ -190,11 +196,11 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
         "bounds": [
           "left": clamp(left),
           "top": clamp(top),
-          "width": clamp(bounds.width / pageBounds.width, minimum: 0.002),
-          "height": clamp(bounds.height / pageBounds.height, minimum: 0.002),
+          "width": clamp(tightBounds.width / pageBounds.width, minimum: 0.002),
+          "height": clamp(tightBounds.height / pageBounds.height, minimum: 0.002),
         ],
-        "fontSize": font?.pointSize ?? max(bounds.height * 0.8, 8),
-        "visualFontSize": font?.pointSize ?? max(bounds.height * 0.8, 8),
+        "fontSize": fontSize,
+        "visualFontSize": fontSize,
         "fontFamily": font?.familyName ?? "Sans",
         "color": argb(color),
         "editable": true,
@@ -251,7 +257,9 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
   }
 
   private func addCover(_ item: [String: Any], to page: PDFPage) {
-    let rect = pdfRect(item, on: page).insetBy(dx: -1.4, dy: -1.4)
+    let originalRect = pdfRect(item, on: page)
+    let inset = max(1.4, min(originalRect.height * 0.18, 6))
+    let rect = originalRect.insetBy(dx: -inset, dy: -inset)
     let annotation = PDFAnnotation(bounds: rect, forType: .square, withProperties: nil)
     annotation.color = .clear
     annotation.interiorColor = color(item["backgroundColor"], fallback: .white)
@@ -361,6 +369,28 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       y: pageBounds.minY + (1 - top - height) * pageBounds.height,
       width: width * pageBounds.width,
       height: height * pageBounds.height
+    )
+  }
+
+  private func tightenedTextBounds(
+    _ bounds: CGRect,
+    text: String,
+    fontSize: CGFloat
+  ) -> CGRect {
+    guard !bounds.isEmpty, fontSize > 0 else { return bounds }
+
+    let estimatedWidth = max(
+      fontSize * 1.4,
+      CGFloat(text.count) * fontSize * 0.58
+    )
+    let width = min(bounds.width, estimatedWidth * 1.15)
+    let height = min(bounds.height, max(fontSize * 1.35, 4))
+
+    return CGRect(
+      x: bounds.minX,
+      y: bounds.maxY - height,
+      width: max(width, 1),
+      height: max(height, 1)
     )
   }
 

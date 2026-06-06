@@ -148,9 +148,10 @@ class _EditorScreenState extends State<EditorScreen> {
         pageIndex: pageIndex,
       );
       final styledBlocks = await _applyRenderedTextStyles(blocks);
+      final visibleBlocks = _filterReplacedTextBlocks(pageIndex, styledBlocks);
       if (!mounted) return;
       setState(() {
-        _textBlocks = {..._textBlocks, pageIndex: styledBlocks};
+        _textBlocks = {..._textBlocks, pageIndex: visibleBlocks};
         _extractingText = false;
         _status = '';
       });
@@ -323,8 +324,44 @@ class _EditorScreenState extends State<EditorScreen> {
         annotations: [..._annotations, annotation],
         updatedAt: DateTime.now(),
       );
+      _removeReplacedTextBlock(annotation);
       _dirty = true;
     });
+  }
+
+  void _removeReplacedTextBlock(PdfAnnotation annotation) {
+    if (annotation.type != AnnotationType.textReplacement) return;
+    final pageBlocks = _textBlocks[annotation.pageIndex];
+    if (pageBlocks == null || pageBlocks.isEmpty) return;
+
+    _textBlocks = {
+      ..._textBlocks,
+      annotation.pageIndex: _filterReplacedTextBlocks(
+        annotation.pageIndex,
+        pageBlocks,
+      ),
+    };
+  }
+
+  List<PdfTextBlock> _filterReplacedTextBlocks(
+    int pageIndex,
+    List<PdfTextBlock> blocks,
+  ) {
+    final replacements = _annotations.where(
+      (annotation) =>
+          annotation.pageIndex == pageIndex &&
+          annotation.type == AnnotationType.textReplacement &&
+          (annotation.originalText?.trim().isNotEmpty ?? false),
+    );
+
+    return blocks.where((block) {
+      return !replacements.any((annotation) {
+        final sameText = block.text.trim() == annotation.originalText!.trim();
+        final overlap =
+            _rectOverlapRatio(block.bounds, annotation.bounds) > 0.25;
+        return sameText && overlap;
+      });
+    }).toList();
   }
 
   Future<void> _updateAnnotation(PdfAnnotation annotation) async {
@@ -1050,16 +1087,10 @@ class _TextBlockTarget extends StatelessWidget {
       top: rect.top,
       width: rect.width,
       height: math.max(rect.height, 22),
-      child: Tooltip(
-        message: 'Edit text',
-        child: Material(
-          color: Colors.transparent,
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(4),
-            child: const SizedBox.expand(),
-          ),
-        ),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: const SizedBox.expand(),
       ),
     );
   }
@@ -1168,6 +1199,7 @@ class _TextAnnotationTarget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final rect = _scaleRect(annotation.bounds, size);
+    final showChrome = annotation.type == AnnotationType.textOverlay;
     return Positioned(
       left: rect.left,
       top: rect.top,
@@ -1176,41 +1208,43 @@ class _TextAnnotationTarget extends StatelessWidget {
       child: GestureDetector(
         behavior: HitTestBehavior.translucent,
         onTap: onTap,
-        onPanUpdate: (details) => _move(details.delta),
+        onPanUpdate: showChrome ? (details) => _move(details.delta) : null,
         child: Stack(
           clipBehavior: Clip.none,
           children: [
-            Positioned.fill(
-              child: IgnorePointer(
-                child: DecoratedBox(
-                  decoration: BoxDecoration(
-                    border: Border.all(
-                      color: AppTheme.accent.withValues(alpha: 0.48),
+            if (showChrome)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: DecoratedBox(
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: AppTheme.accent.withValues(alpha: 0.48),
+                      ),
+                      borderRadius: BorderRadius.circular(3),
                     ),
-                    borderRadius: BorderRadius.circular(3),
                   ),
                 ),
               ),
-            ),
-            Positioned(
-              right: -8,
-              bottom: -8,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onPanUpdate: (details) => _resize(details.delta),
-                child: Container(
-                  width: 24,
-                  height: 24,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    color: AppTheme.surface.withValues(alpha: 0.94),
-                    border: Border.all(color: AppTheme.accent),
-                    shape: BoxShape.circle,
+            if (showChrome)
+              Positioned(
+                right: -8,
+                bottom: -8,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onPanUpdate: (details) => _resize(details.delta),
+                  child: Container(
+                    width: 24,
+                    height: 24,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: AppTheme.surface.withValues(alpha: 0.94),
+                      border: Border.all(color: AppTheme.accent),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(Icons.open_in_full_rounded, size: 12),
                   ),
-                  child: const Icon(Icons.open_in_full_rounded, size: 12),
                 ),
               ),
-            ),
           ],
         ),
       ),
@@ -1356,7 +1390,8 @@ class _AnnotationPainter extends CustomPainter {
     final text = annotation.text ?? '';
     if (whiteout) {
       final paint = Paint()..color = annotation.backgroundColor ?? Colors.white;
-      canvas.drawRect(rect.inflate(1.4), paint);
+      final inset = math.max(1.4, math.min(rect.height * 0.18, 6.0));
+      canvas.drawRect(rect.inflate(inset), paint);
     }
 
     final painter = TextPainter(
@@ -1736,7 +1771,7 @@ class _TextEditSheetState extends State<_TextEditSheet> {
     Rect? existingBounds,
   ) {
     if (existingBounds != null) {
-      return _expandTextBounds(existingBounds, text, layoutFontSize);
+      return existingBounds;
     }
 
     if (block == null) {
@@ -1751,21 +1786,7 @@ class _TextEditSheetState extends State<_TextEditSheet> {
       );
     }
 
-    return _expandTextBounds(block.bounds, text, layoutFontSize);
-  }
-
-  Rect _expandTextBounds(Rect current, String text, double layoutFontSize) {
-    final estimatedWidth = _estimatedTextWidth(text, layoutFontSize);
-    final estimatedHeight = (layoutFontSize * 1.18 / widget.pageSize.height)
-        .clamp(current.height, 0.18);
-    final width = math.max(current.width, estimatedWidth);
-    final height = math.max(current.height, estimatedHeight);
-    return Rect.fromLTWH(
-      current.left.clamp(0, 1 - width).toDouble(),
-      current.top.clamp(0, 1 - height).toDouble(),
-      width.clamp(0.02, 1 - current.left).toDouble(),
-      height.clamp(0.01, 1 - current.top).toDouble(),
-    );
+    return block.bounds;
   }
 
   double _estimatedTextWidth(String text, double fontSize) {
@@ -2389,4 +2410,17 @@ Rect _clampRect(Rect rect) {
   final left = normalized.left.clamp(0, 1 - width).toDouble();
   final top = normalized.top.clamp(0, 1 - height).toDouble();
   return Rect.fromLTWH(left, top, width, height);
+}
+
+double _rectOverlapRatio(Rect a, Rect b) {
+  final left = math.max(a.left, b.left);
+  final top = math.max(a.top, b.top);
+  final right = math.min(a.right, b.right);
+  final bottom = math.min(a.bottom, b.bottom);
+  if (right <= left || bottom <= top) return 0;
+
+  final overlapArea = (right - left) * (bottom - top);
+  final smallerArea = math.min(a.width * a.height, b.width * b.height);
+  if (smallerArea <= 0) return 0;
+  return overlapArea / smallerArea;
 }
