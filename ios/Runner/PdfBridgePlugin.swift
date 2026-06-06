@@ -376,6 +376,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       glyphs.append(
         TextGlyph(
           text: text,
+          sourceIndex: index,
           bounds: bounds,
           fontSize: font?.pointSize ?? max(bounds.height * 0.8, 8),
           fontFamily: font?.familyName ?? "Sans",
@@ -414,7 +415,9 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       }
     }
 
-    let visualLines = glyphLines.flatMap { splitVisualLine($0) }.sorted {
+    let visualLines = glyphLines.flatMap {
+      splitVisualLine($0, sourceText: plainText)
+    }.sorted {
       let verticalDifference = abs($0.bounds.maxY - $1.bounds.maxY)
       if verticalDifference > 2 {
         return $0.bounds.maxY > $1.bounds.maxY
@@ -434,7 +437,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     return abs(glyph.bounds.midY - averageY) <= threshold
   }
 
-  private func splitVisualLine(_ line: [TextGlyph]) -> [TextLine] {
+  private func splitVisualLine(_ line: [TextGlyph], sourceText: NSString?) -> [TextLine] {
     let ordered = line.sorted { $0.bounds.minX < $1.bounds.minX }
     guard let first = ordered.first else { return [] }
 
@@ -450,10 +453,10 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       previous = glyph
     }
 
-    return groups.compactMap { makeTextLine($0) }
+    return groups.compactMap { makeTextLine($0, sourceText: sourceText) }
   }
 
-  private func makeTextLine(_ glyphs: [TextGlyph]) -> TextLine? {
+  private func makeTextLine(_ glyphs: [TextGlyph], sourceText: NSString?) -> TextLine? {
     guard let first = glyphs.first else { return nil }
     var text = ""
     var bounds = first.bounds
@@ -461,8 +464,9 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
     for glyph in glyphs {
       if let previous = previous {
-        let gap = glyph.bounds.minX - previous.bounds.maxX
-        if gap > max(0.8, previous.fontSize * 0.12), !text.hasSuffix(" ") {
+        if shouldInsertSpace(between: previous, and: glyph, sourceText: sourceText),
+          !text.hasSuffix(" ")
+        {
           text.append(" ")
         }
       }
@@ -471,7 +475,10 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       previous = glyph
     }
 
-    let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let cleanText = text
+      .components(separatedBy: .whitespacesAndNewlines)
+      .filter { !$0.isEmpty }
+      .joined(separator: " ")
     guard !cleanText.isEmpty else { return nil }
     return TextLine(
       text: cleanText,
@@ -480,6 +487,38 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       fontFamily: first.fontFamily,
       color: first.color
     )
+  }
+
+  private func shouldInsertSpace(
+    between previous: TextGlyph,
+    and glyph: TextGlyph,
+    sourceText: NSString?
+  ) -> Bool {
+    if let sourceText = sourceText,
+      glyph.sourceIndex > previous.sourceIndex + 1,
+      glyph.sourceIndex <= sourceText.length
+    {
+      let location = previous.sourceIndex + 1
+      let length = glyph.sourceIndex - location
+      if length > 0 {
+        let skippedText = sourceText.substring(
+          with: NSRange(location: location, length: length)
+        )
+        if skippedText.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+          return true
+        }
+      }
+    }
+
+    let gap = glyph.bounds.minX - previous.bounds.maxX
+    let fontSize = max(previous.fontSize, glyph.fontSize)
+    let fallbackGap: CGFloat
+    if sourceText == nil {
+      fallbackGap = max(3, fontSize * 0.35)
+    } else {
+      fallbackGap = max(5, fontSize * 0.55)
+    }
+    return gap > fallbackGap
   }
 
   private func groupParagraphs(_ lines: [TextLine]) -> [TextParagraph] {
@@ -543,8 +582,91 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     let smallerFont = max(1, min(previous.fontSize, line.fontSize))
     let fontRatio = max(previous.fontSize, line.fontSize) / smallerFont
     guard fontRatio <= 1.65 else { return nil }
+    guard isParagraphContinuation(from: paragraph, to: line) else { return nil }
 
     return max(0, verticalGap) + leftDifference * 0.12 - overlapRatio * 4
+  }
+
+  private func isParagraphContinuation(from paragraph: TextParagraph, to line: TextLine) -> Bool {
+    guard let previous = paragraph.lines.last else { return false }
+    let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !previousText.isEmpty, !text.isEmpty else { return false }
+    if previousText.hasSuffix(":") || startsNewTextSection(text) {
+      return false
+    }
+    if paragraph.lines.count >= 2,
+      !paragraph.lines.allSatisfy({ looksLikeFieldLabel($0.text) })
+    {
+      return true
+    }
+    if looksLikeFieldLabel(previousText) && looksLikeFieldLabel(text) {
+      return false
+    }
+    if looksLikeFieldLabel(text) && endsSentence(previousText) {
+      return false
+    }
+
+    return isParagraphSized(previous) || isParagraphSized(line)
+  }
+
+  private func startsNewTextSection(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let first = trimmed.first else { return false }
+    if "•-–—*?▪".contains(first) {
+      return true
+    }
+    return trimmed.range(
+      of: #"^\d+[\.\)]\s+"#,
+      options: .regularExpression
+    ) != nil
+  }
+
+  private func looksLikeFieldLabel(_ text: String) -> Bool {
+    if text.rangeOfCharacter(from: CharacterSet(charactersIn: ".,;:!?")) != nil {
+      return false
+    }
+
+    let words = text
+      .split { $0.isWhitespace }
+      .map(String.init)
+      .filter { !$0.isEmpty }
+    guard !words.isEmpty, words.count <= 5 else {
+      return false
+    }
+
+    let meaningfulCount = text.filter { !$0.isWhitespace }.count
+    guard meaningfulCount <= 40 else {
+      return false
+    }
+
+    let formTerms = [
+      "account", "address", "bank", "birth", "date", "email", "holder", "iban",
+      "id", "identity", "name", "national", "number", "phone", "serial", "tax",
+    ]
+    let lowerWords = words.map { $0.lowercased() }
+    if lowerWords.contains(where: { formTerms.contains($0) }) {
+      return true
+    }
+
+    return words.count <= 3
+  }
+
+  private func isParagraphSized(_ line: TextLine) -> Bool {
+    let meaningfulCount = line.text.filter { !$0.isWhitespace }.count
+    if meaningfulCount >= 28 {
+      return true
+    }
+
+    let estimatedCharacters = line.bounds.width / max(line.fontSize * 0.52, 1)
+    return estimatedCharacters >= 28
+  }
+
+  private func endsSentence(_ text: String) -> Bool {
+    guard let last = text.trimmingCharacters(in: .whitespacesAndNewlines).last else {
+      return false
+    }
+    return ".!?".contains(last)
   }
 
   private func textBlock(
@@ -657,6 +779,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
 private struct TextGlyph {
   let text: String
+  let sourceIndex: Int
   let bounds: CGRect
   let fontSize: CGFloat
   let fontFamily: String

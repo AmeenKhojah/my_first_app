@@ -23,8 +23,10 @@ public final class PdfParagraphAudit {
       extractor.setStartPage(pageIndex + 1);
       extractor.setEndPage(pageIndex + 1);
       extractor.getText(document);
-      paragraphs = groupParagraphs(extractor.glyphs);
+      paragraphs = groupParagraphs(extractor.glyphs, null);
     }
+
+    runSyntheticRegressions();
 
     for (int index = 0; index < paragraphs.size(); index++) {
       Paragraph paragraph = paragraphs.get(index);
@@ -67,7 +69,82 @@ public final class PdfParagraphAudit {
     }
   }
 
-  private static List<Paragraph> groupParagraphs(List<Glyph> glyphs) {
+  private static void runSyntheticRegressions() {
+    assertNoLetterSpacingRegression();
+    assertStackedLabelsStaySeparate();
+    assertWrappedParagraphStillMerges();
+  }
+
+  private static void assertNoLetterSpacingRegression() {
+    String source = "Serial Number IBAN";
+    List<Glyph> glyphs = glyphsForTextLine(source, 40, 80, 10, 0);
+    List<Paragraph> paragraphs = groupParagraphs(glyphs, source);
+    if (paragraphs.size() != 1 || !paragraphs.get(0).text().equals(source)) {
+      throw new IllegalStateException("Letter spacing regression: " + paragraphs);
+    }
+  }
+
+  private static void assertStackedLabelsStaySeparate() {
+    List<Glyph> glyphs = new ArrayList<>();
+    glyphs.add(lineGlyph("IBAN Number", 60, 100, 10, 0));
+    glyphs.add(lineGlyph("National ID", 60, 113, 10, 20));
+    glyphs.add(lineGlyph("Serial Number", 60, 126, 10, 40));
+
+    List<Paragraph> paragraphs = groupParagraphs(glyphs, null);
+    if (paragraphs.size() != 3) {
+      throw new IllegalStateException("Stacked label regression: " + paragraphTexts(paragraphs));
+    }
+  }
+
+  private static void assertWrappedParagraphStillMerges() {
+    List<Glyph> glyphs = new ArrayList<>();
+    glyphs.add(lineGlyph("Your legal name and address. These will need to be", 60, 100, 10, 0));
+    glyphs.add(lineGlyph("verified by uploading official identity documents.", 60, 113, 10, 60));
+
+    List<Paragraph> paragraphs = groupParagraphs(glyphs, null);
+    if (paragraphs.size() != 1
+        || !paragraphs.get(0).text().contains("verified by uploading official identity documents")) {
+      throw new IllegalStateException("Wrapped paragraph regression: " + paragraphTexts(paragraphs));
+    }
+  }
+
+  private static List<String> paragraphTexts(List<Paragraph> paragraphs) {
+    return paragraphs.stream().map(Paragraph::text).toList();
+  }
+
+  private static List<Glyph> glyphsForTextLine(
+      String source, double left, double top, double fontSize, int sourceOffset) {
+    List<Glyph> glyphs = new ArrayList<>();
+    double x = left;
+    double width = fontSize * 0.48;
+    for (int index = 0; index < source.length(); index++) {
+      char character = source.charAt(index);
+      if (Character.isWhitespace(character)) {
+        x += width * 1.4;
+        continue;
+      }
+      glyphs.add(
+          new Glyph(
+              String.valueOf(character),
+              sourceOffset + index,
+              new Bounds(x, top, x + width, top + fontSize),
+              fontSize,
+              "Sans"));
+      x += width + 1.2;
+    }
+    return glyphs;
+  }
+
+  private static Glyph lineGlyph(String text, double left, double top, double fontSize, int sourceIndex) {
+    return new Glyph(
+        text,
+        sourceIndex,
+        new Bounds(left, top, left + text.length() * fontSize * 0.48, top + fontSize),
+        fontSize,
+        "Sans");
+  }
+
+  private static List<Paragraph> groupParagraphs(List<Glyph> glyphs, String sourceText) {
     List<Glyph> sorted = new ArrayList<>(glyphs);
     sorted.sort((a, b) -> {
       double verticalDifference = Math.abs(a.midY() - b.midY());
@@ -99,7 +176,7 @@ public final class PdfParagraphAudit {
 
     List<Line> visualLines = new ArrayList<>();
     for (List<Glyph> line : glyphLines) {
-      visualLines.addAll(splitVisualLine(line));
+      visualLines.addAll(splitVisualLine(line, sourceText));
     }
     visualLines.sort(Comparator.comparingDouble((Line line) -> line.bounds.top)
         .thenComparingDouble(line -> line.bounds.left));
@@ -135,7 +212,7 @@ public final class PdfParagraphAudit {
     return Math.abs(glyph.midY() - averageY) <= threshold;
   }
 
-  private static List<Line> splitVisualLine(List<Glyph> glyphs) {
+  private static List<Line> splitVisualLine(List<Glyph> glyphs, String sourceText) {
     List<Glyph> ordered = new ArrayList<>(glyphs);
     ordered.sort(Comparator.comparingDouble(glyph -> glyph.bounds.left));
     List<List<Glyph>> groups = new ArrayList<>();
@@ -156,21 +233,20 @@ public final class PdfParagraphAudit {
 
     List<Line> lines = new ArrayList<>();
     for (List<Glyph> group : groups) {
-      Line line = makeLine(group);
+      Line line = makeLine(group, sourceText);
       if (line != null) lines.add(line);
     }
     return lines;
   }
 
-  private static Line makeLine(List<Glyph> glyphs) {
+  private static Line makeLine(List<Glyph> glyphs, String sourceText) {
     if (glyphs.isEmpty()) return null;
     StringBuilder text = new StringBuilder();
     Bounds bounds = glyphs.get(0).bounds;
     Glyph previous = null;
     for (Glyph glyph : glyphs) {
       if (previous != null) {
-        double gap = glyph.bounds.left - previous.bounds.right;
-        if (gap > Math.max(0.8, previous.fontSize * 0.12)
+        if (shouldInsertSpace(previous, glyph, sourceText)
             && !text.isEmpty()
             && text.charAt(text.length() - 1) != ' ') {
           text.append(' ');
@@ -184,6 +260,24 @@ public final class PdfParagraphAudit {
     return clean.isEmpty()
         ? null
         : new Line(clean, bounds, glyphs.get(0).fontSize, glyphs.get(0).fontName);
+  }
+
+  private static boolean shouldInsertSpace(Glyph previous, Glyph glyph, String sourceText) {
+    if (sourceText != null
+        && glyph.sourceIndex > previous.sourceIndex + 1
+        && glyph.sourceIndex <= sourceText.length()) {
+      int start = previous.sourceIndex + 1;
+      String skipped = sourceText.substring(start, glyph.sourceIndex);
+      if (skipped.chars().anyMatch(Character::isWhitespace)) {
+        return true;
+      }
+    }
+
+    double gap = glyph.bounds.left - previous.bounds.right;
+    double fontSize = Math.max(previous.fontSize, glyph.fontSize);
+    double fallbackGap =
+        sourceText == null ? Math.max(0.8, fontSize * 0.12) : Math.max(5, fontSize * 0.55);
+    return gap > fallbackGap;
   }
 
   private static Double paragraphJoinScore(Paragraph paragraph, Line line) {
@@ -207,8 +301,67 @@ public final class PdfParagraphAudit {
     double smallerFont = Math.max(1, Math.min(previous.fontSize, line.fontSize));
     double fontRatio = Math.max(previous.fontSize, line.fontSize) / smallerFont;
     if (fontRatio > 1.65) return null;
+    if (!isParagraphContinuation(paragraph, line)) return null;
 
     return Math.max(0, verticalGap) + leftDifference * 0.12 - overlapRatio * 4;
+  }
+
+  private static boolean isParagraphContinuation(Paragraph paragraph, Line line) {
+    if (paragraph.lines.isEmpty()) return false;
+    Line previous = paragraph.lines.get(paragraph.lines.size() - 1);
+    String previousText = previous.text.strip();
+    String text = line.text.strip();
+    if (previousText.isEmpty() || text.isEmpty()) return false;
+    if (previousText.endsWith(":") || startsNewTextSection(text)) return false;
+    if (paragraph.lines.size() >= 2
+        && !paragraph.lines.stream().allMatch(item -> looksLikeFieldLabel(item.text))) {
+      return true;
+    }
+    if (looksLikeFieldLabel(previousText) && looksLikeFieldLabel(text)) return false;
+    if (looksLikeFieldLabel(text) && endsSentence(previousText)) return false;
+    return isParagraphSized(previous) || isParagraphSized(line);
+  }
+
+  private static boolean startsNewTextSection(String text) {
+    String trimmed = text.strip();
+    if (trimmed.isEmpty()) return false;
+    char first = trimmed.charAt(0);
+    if ("•-–—*?▪".indexOf(first) >= 0) return true;
+    return trimmed.matches("^\\d+[\\.)]\\s+.*");
+  }
+
+  private static boolean looksLikeFieldLabel(String text) {
+    if (text.matches(".*[.,;:!?].*")) return false;
+    String[] words = text.strip().split("\\s+");
+    if (words.length == 0 || words.length > 5) return false;
+    int meaningfulCount = text.replaceAll("\\s+", "").length();
+    if (meaningfulCount > 40) return false;
+
+    for (String word : words) {
+      String lower = word.toLowerCase(Locale.US);
+      if (List.of(
+              "account", "address", "bank", "birth", "date", "email", "holder", "iban",
+              "id", "identity", "name", "national", "number", "phone", "serial", "tax")
+          .contains(lower)) {
+        return true;
+      }
+    }
+    return words.length <= 3;
+  }
+
+  private static boolean isParagraphSized(Line line) {
+    int meaningfulCount = line.text.replaceAll("\\s+", "").length();
+    if (meaningfulCount >= 28) return true;
+
+    double estimatedCharacters = line.bounds.width() / Math.max(line.fontSize * 0.52, 1);
+    return estimatedCharacters >= 28;
+  }
+
+  private static boolean endsSentence(String text) {
+    String stripped = text.strip();
+    if (stripped.isEmpty()) return false;
+    char last = stripped.charAt(stripped.length() - 1);
+    return ".!?".indexOf(last) >= 0;
   }
 
   private static final class Extractor extends PDFTextStripper {
@@ -224,6 +377,7 @@ public final class PdfParagraphAudit {
       glyphs.add(
           new Glyph(
               text,
+              glyphs.size(),
               new Bounds(
                   position.getXDirAdj(),
                   position.getYDirAdj() - height,
@@ -234,7 +388,7 @@ public final class PdfParagraphAudit {
     }
   }
 
-  private record Glyph(String text, Bounds bounds, double fontSize, String fontName) {
+  private record Glyph(String text, int sourceIndex, Bounds bounds, double fontSize, String fontName) {
     double midY() {
       return (bounds.top + bounds.bottom) / 2;
     }
