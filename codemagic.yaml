@@ -10,8 +10,6 @@ workflows:
     scripts:
       - name: Get Flutter packages
         script: flutter pub get
-      - name: Regenerate iOS project metadata
-        script: flutter create --platforms=ios .
       - name: Build iOS app without code signing
         script: flutter build ios --release --no-codesign
     artifacts:
