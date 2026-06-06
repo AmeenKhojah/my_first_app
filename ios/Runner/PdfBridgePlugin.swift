@@ -160,8 +160,13 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       return []
     }
 
-    return textRuns(on: page).enumerated().map { index, run in
-      textBlock(run, id: "p\(pageIndex)-r\(index)", pageIndex: pageIndex, pageBounds: pageBounds)
+    return textParagraphs(on: page).enumerated().map { index, paragraph in
+      textBlock(
+        paragraph,
+        id: "p\(pageIndex)-paragraph\(index)",
+        pageIndex: pageIndex,
+        pageBounds: pageBounds
+      )
     }
   }
 
@@ -334,7 +339,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     )
   }
 
-  private func textRuns(on page: PDFPage) -> [TextRun] {
+  private func textParagraphs(on page: PDFPage) -> [TextParagraph] {
     let attributedText = page.attributedString
     let plainText = page.string.map { $0 as NSString }
     var glyphs: [TextGlyph] = []
@@ -379,16 +384,45 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       )
     }
 
-    var lines: [[TextGlyph]] = []
-    for glyph in glyphs {
-      if !lines.isEmpty, isSameLine(glyph, as: lines[lines.count - 1]) {
-        lines[lines.count - 1].append(glyph)
+    let sortedGlyphs = glyphs.sorted {
+      let verticalDifference = abs($0.bounds.midY - $1.bounds.midY)
+      if verticalDifference > max(2, min($0.bounds.height, $1.bounds.height) * 0.35) {
+        return $0.bounds.midY > $1.bounds.midY
+      }
+      return $0.bounds.minX < $1.bounds.minX
+    }
+
+    var glyphLines: [[TextGlyph]] = []
+    for glyph in sortedGlyphs {
+      var bestIndex: Int?
+      var bestDistance = CGFloat.greatestFiniteMagnitude
+      for index in glyphLines.indices where isSameLine(glyph, as: glyphLines[index]) {
+        let averageY =
+          glyphLines[index].reduce(CGFloat.zero) { $0 + $1.bounds.midY }
+          / CGFloat(glyphLines[index].count)
+        let distance = abs(glyph.bounds.midY - averageY)
+        if distance < bestDistance {
+          bestIndex = index
+          bestDistance = distance
+        }
+      }
+
+      if let bestIndex = bestIndex {
+        glyphLines[bestIndex].append(glyph)
       } else {
-        lines.append([glyph])
+        glyphLines.append([glyph])
       }
     }
 
-    return lines.flatMap { splitTextRuns($0) }
+    let visualLines = glyphLines.flatMap { splitVisualLine($0) }.sorted {
+      let verticalDifference = abs($0.bounds.maxY - $1.bounds.maxY)
+      if verticalDifference > 2 {
+        return $0.bounds.maxY > $1.bounds.maxY
+      }
+      return $0.bounds.minX < $1.bounds.minX
+    }
+
+    return groupParagraphs(visualLines)
   }
 
   private func isSameLine(_ glyph: TextGlyph, as line: [TextGlyph]) -> Bool {
@@ -400,7 +434,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     return abs(glyph.bounds.midY - averageY) <= threshold
   }
 
-  private func splitTextRuns(_ line: [TextGlyph]) -> [TextRun] {
+  private func splitVisualLine(_ line: [TextGlyph]) -> [TextLine] {
     let ordered = line.sorted { $0.bounds.minX < $1.bounds.minX }
     guard let first = ordered.first else { return [] }
 
@@ -408,21 +442,18 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     var previous = first
     for glyph in ordered.dropFirst() {
       let gap = glyph.bounds.minX - previous.bounds.maxX
-      let splitGap = max(2, previous.fontSize * 0.22)
-      let fontChanged = glyph.fontFamily != previous.fontFamily || abs(
-        glyph.fontSize - previous.fontSize
-      ) > max(1, previous.fontSize * 0.15)
-      if gap > splitGap || fontChanged {
+      let splitGap = max(24, max(previous.fontSize, glyph.fontSize) * 2.2)
+      if gap > splitGap {
         groups.append([])
       }
       groups[groups.count - 1].append(glyph)
       previous = glyph
     }
 
-    return groups.compactMap { makeTextRun($0) }
+    return groups.compactMap { makeTextLine($0) }
   }
 
-  private func makeTextRun(_ glyphs: [TextGlyph]) -> TextRun? {
+  private func makeTextLine(_ glyphs: [TextGlyph]) -> TextLine? {
     guard let first = glyphs.first else { return nil }
     var text = ""
     var bounds = first.bounds
@@ -442,7 +473,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
     let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !cleanText.isEmpty else { return nil }
-    return TextRun(
+    return TextLine(
       text: cleanText,
       bounds: bounds,
       fontSize: first.fontSize,
@@ -451,29 +482,94 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     )
   }
 
+  private func groupParagraphs(_ lines: [TextLine]) -> [TextParagraph] {
+    var paragraphs: [TextParagraph] = []
+
+    for line in lines {
+      var bestIndex: Int?
+      var bestScore = CGFloat.greatestFiniteMagnitude
+      for index in paragraphs.indices {
+        guard let score = paragraphJoinScore(paragraphs[index], line: line) else {
+          continue
+        }
+        if score < bestScore {
+          bestIndex = index
+          bestScore = score
+        }
+      }
+
+      if let bestIndex = bestIndex {
+        paragraphs[bestIndex].lines.append(line)
+      } else {
+        paragraphs.append(TextParagraph(lines: [line]))
+      }
+    }
+
+    return paragraphs.sorted {
+      let verticalDifference = abs($0.bounds.maxY - $1.bounds.maxY)
+      if verticalDifference > 2 {
+        return $0.bounds.maxY > $1.bounds.maxY
+      }
+      return $0.bounds.minX < $1.bounds.minX
+    }
+  }
+
+  private func paragraphJoinScore(
+    _ paragraph: TextParagraph,
+    line: TextLine
+  ) -> CGFloat? {
+    guard let previous = paragraph.lines.last else { return nil }
+
+    let verticalGap = previous.bounds.minY - line.bounds.maxY
+    let allowedOverlap = min(previous.bounds.height, line.bounds.height) * 0.2
+    let maximumGap = max(previous.bounds.height, line.bounds.height) * 1.9
+    guard verticalGap >= -allowedOverlap, verticalGap <= maximumGap else {
+      return nil
+    }
+
+    let overlap = max(
+      0,
+      min(previous.bounds.maxX, line.bounds.maxX)
+        - max(previous.bounds.minX, line.bounds.minX)
+    )
+    let smallerWidth = max(1, min(previous.bounds.width, line.bounds.width))
+    let overlapRatio = overlap / smallerWidth
+    let leftDifference = abs(previous.bounds.minX - line.bounds.minX)
+    let alignmentTolerance = max(18, max(previous.fontSize, line.fontSize) * 2.2)
+    guard overlapRatio >= 0.2 || leftDifference <= alignmentTolerance else {
+      return nil
+    }
+
+    let smallerFont = max(1, min(previous.fontSize, line.fontSize))
+    let fontRatio = max(previous.fontSize, line.fontSize) / smallerFont
+    guard fontRatio <= 1.65 else { return nil }
+
+    return max(0, verticalGap) + leftDifference * 0.12 - overlapRatio * 4
+  }
+
   private func textBlock(
-    _ run: TextRun,
+    _ paragraph: TextParagraph,
     id: String,
     pageIndex: Int,
     pageBounds: CGRect
   ) -> [String: Any] {
-    let bounds = run.bounds.intersection(pageBounds)
+    let bounds = paragraph.bounds.intersection(pageBounds)
     let left = (bounds.minX - pageBounds.minX) / pageBounds.width
     let top = (pageBounds.maxY - bounds.maxY) / pageBounds.height
     return [
       "id": id,
       "pageIndex": pageIndex,
-      "text": run.text,
+      "text": paragraph.text,
       "bounds": [
         "left": clamp(left),
         "top": clamp(top),
         "width": clamp(bounds.width / pageBounds.width, minimum: 0.002),
         "height": clamp(bounds.height / pageBounds.height, minimum: 0.002),
       ],
-      "fontSize": run.fontSize,
-      "visualFontSize": run.fontSize,
-      "fontFamily": run.fontFamily,
-      "color": argb(run.color),
+      "fontSize": paragraph.fontSize,
+      "visualFontSize": paragraph.fontSize,
+      "fontFamily": paragraph.fontFamily,
+      "color": argb(paragraph.color),
       "editable": true,
     ]
   }
@@ -567,12 +663,38 @@ private struct TextGlyph {
   let color: UIColor
 }
 
-private struct TextRun {
+private struct TextLine {
   let text: String
   let bounds: CGRect
   let fontSize: CGFloat
   let fontFamily: String
   let color: UIColor
+}
+
+private struct TextParagraph {
+  var lines: [TextLine]
+
+  var text: String {
+    lines.map(\.text).joined(separator: "\n")
+  }
+
+  var bounds: CGRect {
+    lines.dropFirst().reduce(lines.first?.bounds ?? .null) {
+      $0.union($1.bounds)
+    }
+  }
+
+  var fontSize: CGFloat {
+    lines.first?.fontSize ?? 12
+  }
+
+  var fontFamily: String {
+    lines.first?.fontFamily ?? "Sans"
+  }
+
+  var color: UIColor {
+    lines.first?.color ?? .black
+  }
 }
 
 private enum BridgeError: LocalizedError {
