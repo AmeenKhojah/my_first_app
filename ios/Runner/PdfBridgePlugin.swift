@@ -220,12 +220,12 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
   private func addCover(_ item: [String: Any], to page: PDFPage) {
     let originalRect = pdfRect(item, on: page)
-    let rect = CGRect(
-      x: originalRect.minX - 0.35,
-      y: originalRect.minY,
-      width: originalRect.width + 0.7,
-      height: originalRect.height
-    )
+    let fontSize = max(1, min(number(item["visualFontSize"], fallback: number(item["fontSize"], fallback: 14)), 144))
+    let horizontalPadding = max(0.35, min(fontSize * 0.08, 1.4))
+    let verticalPadding = max(0.5, min(fontSize * 0.16, 2.2))
+    let rect = originalRect
+      .insetBy(dx: -horizontalPadding, dy: -verticalPadding)
+      .intersection(page.bounds(for: .mediaBox))
     let annotation = PDFAnnotation(bounds: rect, forType: .square, withProperties: nil)
     annotation.color = .clear
     annotation.interiorColor = color(item["backgroundColor"], fallback: .white)
@@ -341,16 +341,26 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
   private func textParagraphs(on page: PDFPage) -> [TextParagraph] {
     let attributedText = page.attributedString
-    let plainText = page.string.map { $0 as NSString }
+    let sourceText: NSString?
+    if let attributedText = attributedText, attributedText.length >= page.numberOfCharacters {
+      sourceText = attributedText.string as NSString
+    } else if let pageText = page.string, (pageText as NSString).length == page.numberOfCharacters {
+      sourceText = pageText as NSString
+    } else {
+      sourceText = nil
+    }
     var glyphs: [TextGlyph] = []
 
     for index in 0..<page.numberOfCharacters {
       let range = NSRange(location: index, length: 1)
+      let selection = page.selection(for: range)
       let rawText: String
-      if let plainText = plainText, index < plainText.length {
-        rawText = plainText.substring(with: range)
+      if let selectionText = selection?.string, !selectionText.isEmpty {
+        rawText = selectionText
+      } else if let sourceText = sourceText, index < sourceText.length {
+        rawText = sourceText.substring(with: range)
       } else {
-        rawText = page.selection(for: range)?.string ?? ""
+        rawText = ""
       }
       let text = rawText.replacingOccurrences(of: "\n", with: "")
         .replacingOccurrences(of: "\r", with: "")
@@ -358,7 +368,11 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
         continue
       }
 
-      let bounds = page.characterBounds(at: index)
+      let characterBounds = page.characterBounds(at: index)
+      let selectionBounds = selection?.bounds(for: page) ?? .null
+      let bounds = validTextBounds(characterBounds)
+        ? characterBounds
+        : selectionBounds
       guard bounds.width > 0, bounds.height > 0,
         bounds.minX.isFinite, bounds.minY.isFinite,
         bounds.width.isFinite, bounds.height.isFinite
@@ -416,7 +430,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     }
 
     let visualLines = glyphLines.flatMap {
-      splitVisualLine($0, sourceText: plainText)
+      splitVisualLine($0, sourceText: sourceText)
     }.sorted {
       let verticalDifference = abs($0.bounds.maxY - $1.bounds.maxY)
       if verticalDifference > 2 {
@@ -426,6 +440,12 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     }
 
     return groupParagraphs(visualLines)
+  }
+
+  private func validTextBounds(_ bounds: CGRect) -> Bool {
+    bounds.width > 0 && bounds.height > 0
+      && bounds.minX.isFinite && bounds.minY.isFinite
+      && bounds.width.isFinite && bounds.height.isFinite
   }
 
   private func isSameLine(_ glyph: TextGlyph, as line: [TextGlyph]) -> Bool {
@@ -482,11 +502,19 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     guard !cleanText.isEmpty else { return nil }
     return TextLine(
       text: cleanText,
-      bounds: bounds,
+      bounds: expandedLineBounds(bounds, fontSize: first.fontSize),
+      inkBounds: bounds,
       fontSize: first.fontSize,
       fontFamily: first.fontFamily,
       color: first.color
     )
+  }
+
+  private func expandedLineBounds(_ bounds: CGRect, fontSize: CGFloat) -> CGRect {
+    let lineHeight = max(bounds.height, fontSize * 1.22)
+    let extraHeight = max(0, lineHeight - bounds.height)
+    let horizontalPadding = max(0.4, min(fontSize * 0.08, 1.4))
+    return bounds.insetBy(dx: -horizontalPadding, dy: -extraHeight / 2)
   }
 
   private func shouldInsertSpace(
@@ -494,6 +522,9 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     and glyph: TextGlyph,
     sourceText: NSString?
   ) -> Bool {
+    let gap = glyph.bounds.minX - previous.bounds.maxX
+    let fontSize = max(previous.fontSize, glyph.fontSize)
+
     if let sourceText = sourceText,
       glyph.sourceIndex > previous.sourceIndex + 1,
       glyph.sourceIndex <= sourceText.length
@@ -505,13 +536,11 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
           with: NSRange(location: location, length: length)
         )
         if skippedText.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
-          return true
+          return gap > max(2.2, fontSize * 0.22)
         }
       }
     }
 
-    let gap = glyph.bounds.minX - previous.bounds.maxX
-    let fontSize = max(previous.fontSize, glyph.fontSize)
     let fallbackGap: CGFloat
     if sourceText == nil {
       fallbackGap = max(3, fontSize * 0.35)
@@ -559,21 +588,26 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
   ) -> CGFloat? {
     guard let previous = paragraph.lines.last else { return nil }
 
-    let verticalGap = previous.bounds.minY - line.bounds.maxY
-    let allowedOverlap = min(previous.bounds.height, line.bounds.height) * 0.2
-    let maximumGap = max(previous.bounds.height, line.bounds.height) * 1.9
+    let previousBounds = previous.inkBounds
+    let lineBounds = line.inkBounds
+    let verticalGap = previousBounds.minY - lineBounds.maxY
+    let allowedOverlap = min(previousBounds.height, lineBounds.height) * 0.2
+    let maximumGap = max(
+      max(previousBounds.height, lineBounds.height) * 1.9,
+      max(previous.fontSize, line.fontSize) * 1.18
+    )
     guard verticalGap >= -allowedOverlap, verticalGap <= maximumGap else {
       return nil
     }
 
     let overlap = max(
       0,
-      min(previous.bounds.maxX, line.bounds.maxX)
-        - max(previous.bounds.minX, line.bounds.minX)
+      min(previousBounds.maxX, lineBounds.maxX)
+        - max(previousBounds.minX, lineBounds.minX)
     )
-    let smallerWidth = max(1, min(previous.bounds.width, line.bounds.width))
+    let smallerWidth = max(1, min(previousBounds.width, lineBounds.width))
     let overlapRatio = overlap / smallerWidth
-    let leftDifference = abs(previous.bounds.minX - line.bounds.minX)
+    let leftDifference = abs(previousBounds.minX - lineBounds.minX)
     let alignmentTolerance = max(18, max(previous.fontSize, line.fontSize) * 2.2)
     guard overlapRatio >= 0.2 || leftDifference <= alignmentTolerance else {
       return nil
@@ -582,17 +616,43 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     let smallerFont = max(1, min(previous.fontSize, line.fontSize))
     let fontRatio = max(previous.fontSize, line.fontSize) / smallerFont
     guard fontRatio <= 1.65 else { return nil }
-    guard isParagraphContinuation(from: paragraph, to: line) else { return nil }
+    guard isParagraphContinuation(from: paragraph, to: line, verticalGap: verticalGap) else {
+      return nil
+    }
 
     return max(0, verticalGap) + leftDifference * 0.12 - overlapRatio * 4
   }
 
-  private func isParagraphContinuation(from paragraph: TextParagraph, to line: TextLine) -> Bool {
+  private func isParagraphContinuation(
+    from paragraph: TextParagraph,
+    to line: TextLine,
+    verticalGap: CGFloat
+  ) -> Bool {
     guard let previous = paragraph.lines.last else { return false }
     let previousText = previous.text.trimmingCharacters(in: .whitespacesAndNewlines)
     let text = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard !previousText.isEmpty, !text.isEmpty else { return false }
     if previousText.hasSuffix(":") || startsNewTextSection(text) {
+      return false
+    }
+    if looksLikeFieldLabel(text) && (endsSentence(previousText) || text.hasSuffix(":")) {
+      return false
+    }
+    if looksLikeFieldLabel(previousText) && isParagraphSized(line) {
+      return false
+    }
+    if paragraph.lines.count >= 2,
+      let previousGap = previousLineGap(in: paragraph),
+      verticalGap > max(previousGap * 1.55, previousGap + previous.fontSize * 0.45)
+    {
+      return false
+    }
+    if paragraph.lines.count >= 2,
+      let previousGap = previousLineGap(in: paragraph),
+      endsSentence(previousText),
+      startsWithUppercaseLetter(text),
+      verticalGap > max(previousGap * 1.25, previousGap + previous.fontSize * 0.2)
+    {
       return false
     }
     if paragraph.lines.count >= 2,
@@ -610,10 +670,23 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     return isParagraphSized(previous) || isParagraphSized(line)
   }
 
+  private func previousLineGap(in paragraph: TextParagraph) -> CGFloat? {
+    guard paragraph.lines.count >= 2 else { return nil }
+    let earlier = paragraph.lines[paragraph.lines.count - 2]
+    let previous = paragraph.lines[paragraph.lines.count - 1]
+    return max(0, earlier.inkBounds.minY - previous.inkBounds.maxY)
+  }
+
   private func startsNewTextSection(_ text: String) -> Bool {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
     guard let first = trimmed.first else { return false }
     if "•-–—*?▪".contains(first) {
+      return true
+    }
+    let characters = Array(trimmed)
+    if !first.isLetter && !first.isNumber && characters.count > 1,
+      characters[1].isWhitespace
+    {
       return true
     }
     return trimmed.range(
@@ -624,7 +697,9 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
   private func looksLikeFieldLabel(_ text: String) -> Bool {
     if text.rangeOfCharacter(from: CharacterSet(charactersIn: ".,;:!?")) != nil {
-      return false
+      if !text.contains(":") {
+        return false
+      }
     }
 
     let words = text
@@ -640,16 +715,30 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       return false
     }
 
-    let formTerms = [
-      "account", "address", "bank", "birth", "date", "email", "holder", "iban",
-      "id", "identity", "name", "national", "number", "phone", "serial", "tax",
-    ]
-    let lowerWords = words.map { $0.lowercased() }
-    if lowerWords.contains(where: { formTerms.contains($0) }) {
+    if text.contains(":"), words.count <= 6 {
       return true
     }
 
-    return words.count <= 3
+    let lowerWords = words.map { $0.lowercased() }
+    let strongTerms = ["iban", "id", "number", "serial", "swift"]
+    if lowerWords.contains(where: { strongTerms.contains($0) }) {
+      return true
+    }
+    if lowerWords.contains("account"), lowerWords.contains("number") {
+      return true
+    }
+    if lowerWords.contains("national"),
+      lowerWords.contains(where: { $0 == "id" || $0 == "identity" })
+    {
+      return true
+    }
+
+    return words.count <= 2
+  }
+
+  private func startsWithUppercaseLetter(_ text: String) -> Bool {
+    guard let first = text.first(where: { $0.isLetter }) else { return false }
+    return String(first) == String(first).uppercased()
   }
 
   private func isParagraphSized(_ line: TextLine) -> Bool {
@@ -689,7 +778,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
         "height": clamp(bounds.height / pageBounds.height, minimum: 0.002),
       ],
       "fontSize": paragraph.fontSize,
-      "visualFontSize": paragraph.fontSize,
+      "visualFontSize": paragraph.visualFontSize,
       "fontFamily": paragraph.fontFamily,
       "color": argb(paragraph.color),
       "editable": true,
@@ -789,6 +878,7 @@ private struct TextGlyph {
 private struct TextLine {
   let text: String
   let bounds: CGRect
+  let inkBounds: CGRect
   let fontSize: CGFloat
   let fontFamily: String
   let color: UIColor
@@ -809,6 +899,10 @@ private struct TextParagraph {
 
   var fontSize: CGFloat {
     lines.first?.fontSize ?? 12
+  }
+
+  var visualFontSize: CGFloat {
+    fontSize
   }
 
   var fontFamily: String {

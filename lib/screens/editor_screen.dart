@@ -1452,10 +1452,21 @@ class _AnnotationPainter extends CustomPainter {
   ) {
     final rect = _scaleRect(annotation.bounds, size);
     final text = annotation.text ?? '';
+    final previewFontSize = _previewFontSize(
+      annotation.visualFontSize ?? annotation.fontSize,
+      size,
+    );
     if (whiteout) {
       final paint = Paint()..color = annotation.backgroundColor ?? Colors.white;
+      final horizontalPadding = math.max(0.6, previewFontSize * 0.08);
+      final verticalPadding = math.max(0.6, previewFontSize * 0.16);
       canvas.drawRect(
-        Rect.fromLTRB(rect.left - 0.6, rect.top, rect.right + 0.6, rect.bottom),
+        Rect.fromLTRB(
+          rect.left - horizontalPadding,
+          rect.top - verticalPadding,
+          rect.right + horizontalPadding,
+          rect.bottom + verticalPadding,
+        ),
         paint,
       );
     }
@@ -1466,15 +1477,12 @@ class _AnnotationPainter extends CustomPainter {
         style: _googleFontStyle(
           annotation.fontFamily,
           color: annotation.color,
-          fontSize: _previewFontSize(
-            annotation.visualFontSize ?? annotation.fontSize,
-            size,
-          ),
+          fontSize: previewFontSize,
           height: 1.08,
           fontWeight: _fontWeightFor(annotation.fontFamily),
         ),
       ),
-      maxLines: text.contains('\n') ? 4 : 1,
+      maxLines: text.contains('\n') ? null : 1,
       textDirection: TextDirection.ltr,
     )..layout(maxWidth: rect.width);
 
@@ -1716,7 +1724,7 @@ class _TextEditSheetState extends State<_TextEditSheet> {
             TextField(
               controller: _controller,
               autofocus: true,
-              maxLines: 3,
+              maxLines: 6,
               minLines: 1,
               decoration: const InputDecoration(hintText: 'Text'),
             ),
