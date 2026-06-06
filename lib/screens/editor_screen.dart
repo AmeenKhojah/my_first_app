@@ -357,9 +357,8 @@ class _EditorScreenState extends State<EditorScreen> {
     return blocks.where((block) {
       return !replacements.any((annotation) {
         final sameText = block.text.trim() == annotation.originalText!.trim();
-        final overlap =
-            _rectOverlapRatio(block.bounds, annotation.bounds) > 0.25;
-        return sameText && overlap;
+        final overlap = _rectOverlapRatio(block.bounds, annotation.bounds);
+        return overlap > 0.55 || (sameText && overlap > 0.25);
       });
     }).toList();
   }
@@ -391,6 +390,9 @@ class _EditorScreenState extends State<EditorScreen> {
       );
       _dirty = true;
     });
+    if (removed.type == AnnotationType.textReplacement) {
+      await _reloadTextBlocks(removed.pageIndex);
+    }
   }
 
   Future<void> _redo() async {
@@ -403,8 +405,20 @@ class _EditorScreenState extends State<EditorScreen> {
         annotations: [..._annotations, restored],
         updatedAt: DateTime.now(),
       );
+      _removeReplacedTextBlock(restored);
       _dirty = true;
     });
+  }
+
+  Future<void> _reloadTextBlocks(int pageIndex) async {
+    setState(() {
+      final next = {..._textBlocks};
+      next.remove(pageIndex);
+      _textBlocks = next;
+    });
+    if (pageIndex == _pageIndex) {
+      await _loadTextBlocks(pageIndex);
+    }
   }
 
   Future<bool> _saveSession() async {
@@ -926,10 +940,18 @@ class _EditorCanvasState extends State<EditorCanvas> {
                   final size = constraints.biggest;
                   return GestureDetector(
                     behavior: HitTestBehavior.translucent,
-                    onTapDown: widget.tool == EditorTool.addText
-                        ? (details) => widget.onPageTap(
-                            _normalize(details.localPosition, size),
-                          )
+                    onTapDown:
+                        widget.tool == EditorTool.addText ||
+                            widget.tool == EditorTool.selectText
+                        ? (details) {
+                            if (widget.tool == EditorTool.addText) {
+                              widget.onPageTap(
+                                _normalize(details.localPosition, size),
+                              );
+                            } else {
+                              _selectTextAt(details.localPosition, size);
+                            }
+                          }
                         : null,
                     onPanStart: editingGesture
                         ? (details) => _startDrag(details.localPosition, size)
@@ -987,7 +1009,6 @@ class _EditorCanvasState extends State<EditorCanvas> {
                             (block) => _TextBlockTarget(
                               block: block,
                               size: size,
-                              onTap: () => widget.onTextBlockTap(block),
                             ),
                           ),
                         if (widget.tool == EditorTool.selectText)
@@ -1060,6 +1081,45 @@ class _EditorCanvasState extends State<EditorCanvas> {
     }
   }
 
+  void _selectTextAt(Offset localPosition, Size size) {
+    final point = _normalize(localPosition, size);
+    final horizontalPadding = 4 / size.width;
+    final verticalPadding = 4 / size.height;
+
+    Rect hitRect(Rect rect) => Rect.fromLTRB(
+      rect.left - horizontalPadding,
+      rect.top - verticalPadding,
+      rect.right + horizontalPadding,
+      rect.bottom + verticalPadding,
+    );
+
+    final annotations =
+        widget.annotations
+            .where(
+              (annotation) =>
+                  (annotation.type == AnnotationType.textOverlay ||
+                      annotation.type == AnnotationType.textReplacement) &&
+                  hitRect(annotation.bounds).contains(point),
+            )
+            .toList()
+          ..sort(
+            (a, b) => _rectArea(a.bounds).compareTo(_rectArea(b.bounds)),
+          );
+    if (annotations.isNotEmpty) {
+      widget.onTextAnnotationTap(annotations.first);
+      return;
+    }
+
+    final blocks =
+        widget.textBlocks
+            .where((block) => hitRect(block.bounds).contains(point))
+            .toList()
+          ..sort((a, b) => _rectArea(a.bounds).compareTo(_rectArea(b.bounds)));
+    if (blocks.isNotEmpty) {
+      widget.onTextBlockTap(blocks.first);
+    }
+  }
+
   Offset _normalize(Offset offset, Size size) {
     return Offset(
       (offset.dx / size.width).clamp(0, 1).toDouble(),
@@ -1072,25 +1132,30 @@ class _TextBlockTarget extends StatelessWidget {
   const _TextBlockTarget({
     required this.block,
     required this.size,
-    required this.onTap,
   });
 
   final PdfTextBlock block;
   final Size size;
-  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final rect = _scaleRect(block.bounds, size).inflate(2);
+    final rect = _scaleRect(block.bounds, size).inflate(0.75);
     return Positioned(
       left: rect.left,
       top: rect.top,
       width: rect.width,
-      height: math.max(rect.height, 22),
-      child: GestureDetector(
-        behavior: HitTestBehavior.opaque,
-        onTap: onTap,
-        child: const SizedBox.expand(),
+      height: rect.height,
+      child: IgnorePointer(
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: AppTheme.accent.withValues(alpha: 0.018),
+            border: Border.all(
+              color: AppTheme.accent.withValues(alpha: 0.42),
+              width: 0.8,
+            ),
+            borderRadius: BorderRadius.circular(2),
+          ),
+        ),
       ),
     );
   }
@@ -1198,56 +1263,55 @@ class _TextAnnotationTarget extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final rect = _scaleRect(annotation.bounds, size);
-    final showChrome = annotation.type == AnnotationType.textOverlay;
+    final rect = _scaleRect(annotation.bounds, size).inflate(0.75);
+    final movable = annotation.type == AnnotationType.textOverlay;
+    final decoration = BoxDecoration(
+      color: AppTheme.accent.withValues(alpha: 0.018),
+      border: Border.all(
+        color: AppTheme.accent.withValues(alpha: movable ? 0.56 : 0.42),
+        width: movable ? 1 : 0.8,
+      ),
+      borderRadius: BorderRadius.circular(2),
+    );
     return Positioned(
       left: rect.left,
       top: rect.top,
-      width: math.max(rect.width, 28),
-      height: math.max(rect.height, 22),
-      child: GestureDetector(
-        behavior: HitTestBehavior.translucent,
-        onTap: onTap,
-        onPanUpdate: showChrome ? (details) => _move(details.delta) : null,
-        child: Stack(
-          clipBehavior: Clip.none,
-          children: [
-            if (showChrome)
-              Positioned.fill(
-                child: IgnorePointer(
-                  child: DecoratedBox(
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: AppTheme.accent.withValues(alpha: 0.48),
+      width: rect.width,
+      height: rect.height,
+      child: movable
+          ? GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: onTap,
+              onPanUpdate: (details) => _move(details.delta),
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Positioned.fill(
+                    child: DecoratedBox(decoration: decoration),
+                  ),
+                  Positioned(
+                    right: -8,
+                    bottom: -8,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onPanUpdate: (details) => _resize(details.delta),
+                      child: Container(
+                        width: 24,
+                        height: 24,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: AppTheme.surface.withValues(alpha: 0.94),
+                          border: Border.all(color: AppTheme.accent),
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Icon(Icons.open_in_full_rounded, size: 12),
                       ),
-                      borderRadius: BorderRadius.circular(3),
                     ),
                   ),
-                ),
+                ],
               ),
-            if (showChrome)
-              Positioned(
-                right: -8,
-                bottom: -8,
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onPanUpdate: (details) => _resize(details.delta),
-                  child: Container(
-                    width: 24,
-                    height: 24,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: AppTheme.surface.withValues(alpha: 0.94),
-                      border: Border.all(color: AppTheme.accent),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(Icons.open_in_full_rounded, size: 12),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
+            )
+          : IgnorePointer(child: DecoratedBox(decoration: decoration)),
     );
   }
 
@@ -1390,8 +1454,10 @@ class _AnnotationPainter extends CustomPainter {
     final text = annotation.text ?? '';
     if (whiteout) {
       final paint = Paint()..color = annotation.backgroundColor ?? Colors.white;
-      final inset = math.max(1.4, math.min(rect.height * 0.18, 6.0));
-      canvas.drawRect(rect.inflate(inset), paint);
+      canvas.drawRect(
+        Rect.fromLTRB(rect.left - 0.6, rect.top, rect.right + 0.6, rect.bottom),
+        paint,
+      );
     }
 
     final painter = TextPainter(
@@ -2424,3 +2490,5 @@ double _rectOverlapRatio(Rect a, Rect b) {
   if (smallerArea <= 0) return 0;
   return overlapArea / smallerArea;
 }
+
+double _rectArea(Rect rect) => rect.width * rect.height;

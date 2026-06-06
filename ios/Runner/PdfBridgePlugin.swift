@@ -156,55 +156,12 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     }
 
     let pageBounds = page.bounds(for: .mediaBox)
-    guard pageBounds.width > 0, pageBounds.height > 0,
-      let selection = page.selection(for: pageBounds)
-    else {
+    guard pageBounds.width > 0, pageBounds.height > 0 else {
       return []
     }
 
-    return selection.selectionsByLine().enumerated().compactMap { index, line in
-      guard let text = line.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-        !text.isEmpty
-      else {
-        return nil
-      }
-      let bounds = line.bounds(for: page)
-      guard !bounds.isEmpty else { return nil }
-
-      let attributed = line.attributedString
-      let attributes: [NSAttributedString.Key: Any]
-      if let attributed = attributed, attributed.length > 0 {
-        attributes = attributed.attributes(at: 0, effectiveRange: nil)
-      } else {
-        attributes = [:]
-      }
-      let font = attributes[.font] as? UIFont
-      let fontSize = font?.pointSize ?? max(bounds.height * 0.8, 8)
-      let color = attributes[.foregroundColor] as? UIColor ?? .black
-      let tightBounds = tightenedTextBounds(
-        bounds,
-        text: text,
-        fontSize: fontSize
-      )
-      let left = (tightBounds.minX - pageBounds.minX) / pageBounds.width
-      let top = (pageBounds.maxY - tightBounds.maxY) / pageBounds.height
-
-      return [
-        "id": "p\(pageIndex)-l\(index)",
-        "pageIndex": pageIndex,
-        "text": text,
-        "bounds": [
-          "left": clamp(left),
-          "top": clamp(top),
-          "width": clamp(tightBounds.width / pageBounds.width, minimum: 0.002),
-          "height": clamp(tightBounds.height / pageBounds.height, minimum: 0.002),
-        ],
-        "fontSize": fontSize,
-        "visualFontSize": fontSize,
-        "fontFamily": font?.familyName ?? "Sans",
-        "color": argb(color),
-        "editable": true,
-      ]
+    return textRuns(on: page).enumerated().map { index, run in
+      textBlock(run, id: "p\(pageIndex)-r\(index)", pageIndex: pageIndex, pageBounds: pageBounds)
     }
   }
 
@@ -258,8 +215,12 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
 
   private func addCover(_ item: [String: Any], to page: PDFPage) {
     let originalRect = pdfRect(item, on: page)
-    let inset = max(1.4, min(originalRect.height * 0.18, 6))
-    let rect = originalRect.insetBy(dx: -inset, dy: -inset)
+    let rect = CGRect(
+      x: originalRect.minX - 0.35,
+      y: originalRect.minY,
+      width: originalRect.width + 0.7,
+      height: originalRect.height
+    )
     let annotation = PDFAnnotation(bounds: rect, forType: .square, withProperties: nil)
     annotation.color = .clear
     annotation.interiorColor = color(item["backgroundColor"], fallback: .white)
@@ -282,6 +243,7 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
       ?? UIFont.systemFont(ofSize: fontSize)
     annotation.fontColor = color(item["color"], fallback: UIColor(red: 0.18, green: 0.15, blue: 0.13, alpha: 1))
     annotation.color = .clear
+    annotation.interiorColor = .clear
     annotation.border = border(width: 0)
     annotation.alignment = .left
     annotation.shouldPrint = true
@@ -372,26 +334,148 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     )
   }
 
-  private func tightenedTextBounds(
-    _ bounds: CGRect,
-    text: String,
-    fontSize: CGFloat
-  ) -> CGRect {
-    guard !bounds.isEmpty, fontSize > 0 else { return bounds }
+  private func textRuns(on page: PDFPage) -> [TextRun] {
+    let attributedText = page.attributedString
+    let plainText = page.string.map { $0 as NSString }
+    var glyphs: [TextGlyph] = []
 
-    let estimatedWidth = max(
-      fontSize * 1.4,
-      CGFloat(text.count) * fontSize * 0.58
-    )
-    let width = min(bounds.width, estimatedWidth * 1.15)
-    let height = min(bounds.height, max(fontSize * 1.35, 4))
+    for index in 0..<page.numberOfCharacters {
+      let range = NSRange(location: index, length: 1)
+      let rawText: String
+      if let plainText = plainText, index < plainText.length {
+        rawText = plainText.substring(with: range)
+      } else {
+        rawText = page.selection(for: range)?.string ?? ""
+      }
+      let text = rawText.replacingOccurrences(of: "\n", with: "")
+        .replacingOccurrences(of: "\r", with: "")
+      if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        continue
+      }
 
-    return CGRect(
-      x: bounds.minX,
-      y: bounds.maxY - height,
-      width: max(width, 1),
-      height: max(height, 1)
+      let bounds = page.characterBounds(at: index)
+      guard bounds.width > 0, bounds.height > 0,
+        bounds.minX.isFinite, bounds.minY.isFinite,
+        bounds.width.isFinite, bounds.height.isFinite
+      else {
+        continue
+      }
+
+      let attributes: [NSAttributedString.Key: Any]
+      if let attributedText = attributedText, index < attributedText.length {
+        attributes = attributedText.attributes(at: index, effectiveRange: nil)
+      } else {
+        attributes = [:]
+      }
+      let font = attributes[.font] as? UIFont
+      glyphs.append(
+        TextGlyph(
+          text: text,
+          bounds: bounds,
+          fontSize: font?.pointSize ?? max(bounds.height * 0.8, 8),
+          fontFamily: font?.familyName ?? "Sans",
+          color: attributes[.foregroundColor] as? UIColor ?? .black
+        )
+      )
+    }
+
+    var lines: [[TextGlyph]] = []
+    for glyph in glyphs {
+      if !lines.isEmpty, isSameLine(glyph, as: lines[lines.count - 1]) {
+        lines[lines.count - 1].append(glyph)
+      } else {
+        lines.append([glyph])
+      }
+    }
+
+    return lines.flatMap { splitTextRuns($0) }
+  }
+
+  private func isSameLine(_ glyph: TextGlyph, as line: [TextGlyph]) -> Bool {
+    guard !line.isEmpty else { return false }
+    let averageY =
+      line.reduce(CGFloat.zero) { $0 + $1.bounds.midY } / CGFloat(line.count)
+    let lineHeight = line.map(\.bounds.height).max() ?? glyph.bounds.height
+    let threshold = max(2, max(lineHeight, glyph.bounds.height) * 0.55)
+    return abs(glyph.bounds.midY - averageY) <= threshold
+  }
+
+  private func splitTextRuns(_ line: [TextGlyph]) -> [TextRun] {
+    let ordered = line.sorted { $0.bounds.minX < $1.bounds.minX }
+    guard let first = ordered.first else { return [] }
+
+    var groups: [[TextGlyph]] = [[first]]
+    var previous = first
+    for glyph in ordered.dropFirst() {
+      let gap = glyph.bounds.minX - previous.bounds.maxX
+      let splitGap = max(2, previous.fontSize * 0.22)
+      let fontChanged = glyph.fontFamily != previous.fontFamily || abs(
+        glyph.fontSize - previous.fontSize
+      ) > max(1, previous.fontSize * 0.15)
+      if gap > splitGap || fontChanged {
+        groups.append([])
+      }
+      groups[groups.count - 1].append(glyph)
+      previous = glyph
+    }
+
+    return groups.compactMap { makeTextRun($0) }
+  }
+
+  private func makeTextRun(_ glyphs: [TextGlyph]) -> TextRun? {
+    guard let first = glyphs.first else { return nil }
+    var text = ""
+    var bounds = first.bounds
+    var previous: TextGlyph?
+
+    for glyph in glyphs {
+      if let previous = previous {
+        let gap = glyph.bounds.minX - previous.bounds.maxX
+        if gap > max(0.8, previous.fontSize * 0.12), !text.hasSuffix(" ") {
+          text.append(" ")
+        }
+      }
+      text.append(contentsOf: glyph.text)
+      bounds = bounds.union(glyph.bounds)
+      previous = glyph
+    }
+
+    let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !cleanText.isEmpty else { return nil }
+    return TextRun(
+      text: cleanText,
+      bounds: bounds,
+      fontSize: first.fontSize,
+      fontFamily: first.fontFamily,
+      color: first.color
     )
+  }
+
+  private func textBlock(
+    _ run: TextRun,
+    id: String,
+    pageIndex: Int,
+    pageBounds: CGRect
+  ) -> [String: Any] {
+    let bounds = run.bounds.intersection(pageBounds)
+    let left = (bounds.minX - pageBounds.minX) / pageBounds.width
+    let top = (pageBounds.maxY - bounds.maxY) / pageBounds.height
+    return [
+      "id": id,
+      "pageIndex": pageIndex,
+      "text": run.text,
+      "bounds": [
+        "left": clamp(left),
+        "top": clamp(top),
+        "width": clamp(bounds.width / pageBounds.width, minimum: 0.002),
+        "height": clamp(bounds.height / pageBounds.height, minimum: 0.002),
+      ],
+      "fontSize": run.fontSize,
+      "visualFontSize": run.fontSize,
+      "fontFamily": run.fontFamily,
+      "color": argb(run.color),
+      "editable": true,
+    ]
   }
 
   private func border(width: CGFloat) -> PDFBorder {
@@ -473,6 +557,22 @@ final class PdfBridgePlugin: NSObject, UIDocumentPickerDelegate {
     }
     return controller
   }
+}
+
+private struct TextGlyph {
+  let text: String
+  let bounds: CGRect
+  let fontSize: CGFloat
+  let fontFamily: String
+  let color: UIColor
+}
+
+private struct TextRun {
+  let text: String
+  let bounds: CGRect
+  let fontSize: CGFloat
+  let fontFamily: String
+  let color: UIColor
 }
 
 private enum BridgeError: LocalizedError {
